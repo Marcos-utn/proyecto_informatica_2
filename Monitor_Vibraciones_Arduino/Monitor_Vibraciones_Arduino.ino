@@ -12,9 +12,10 @@
  *  - Estados: 0 NORMAL (verde), 1 ALERTA (amarillo), 2 ALARMA (rojo + zumbador),
  *    con histeresis y numero minimo de lecturas consecutivas.
  *  - Funciona de forma autonoma (LEDs/zumbador/rele) y se controla desde Processing.
- *  - Maniobra del motor: un modulo de rele (activo en BAJO) comanda la bobina de un
- *    contactor de 4 polos (3F+N). Arranque solo por orden expresa, disparo automatico
- *    opcional por ALARMA con ENCLAVAMIENTO (no rearranca solo) y arranque siempre en OFF.
+ *  - Maniobra del motor (modulo de rele de 4 canales, activo en BAJO): los 4 reles conmutan
+ *    L1, L2, L3 y N a la vez (o comandan un contactor si N_RELES = 1). Arranque solo por orden
+ *    expresa, disparo automatico opcional por ALARMA con ENCLAVAMIENTO (no rearranca solo)
+ *    y arranque siempre en OFF.
  *
  * Protocolo serie (115200 baud, lineas ASCII terminadas en \n)
  *  Arduino -> PC
@@ -40,8 +41,8 @@ const uint8_t PIN_BUZZER    = 5;   // a la base de un NPN (via 2,2 kOhm) o al pi
 const uint8_t PIN_BTN_ACK   = 6;   // pulsador a GND (INPUT_PULLUP)
 // Modulo de rele de 4 canales con optoacopladores: se ACTIVA con 0 V (nivel BAJO).
 const uint8_t PINES_RELE[4] = {7, 8, 9, 10};   // IN1..IN4
-const uint8_t N_RELES = 1;     // 1 = IN1 comanda la bobina de un contactor (RECOMENDADO)
-                               // 4 = los 4 canales conmutan a la vez (solo para cargas dentro de la capacidad del rele)
+const uint8_t N_RELES = 4;     // 4 = L1->CH1, L2->CH2, L3->CH3, N->CH4: los 4 reles conmutan a la vez (motor <= 0,75 HP)
+                               // 1 = solo IN1, para comandar la bobina de un contactor de 4 polos (opcion para motores mayores)
 const bool    RELE_ACTIVO_ALTO = false;
 const uint32_t GRACIA_ARRANQUE_MS = 15000;   // tras arrancar no se dispara por vibracion (transitorio de arranque)
 
