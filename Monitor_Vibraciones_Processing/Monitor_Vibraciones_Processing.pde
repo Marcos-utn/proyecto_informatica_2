@@ -56,6 +56,7 @@ ArrayList<Btn> btns = new ArrayList<Btn>();
 Btn bPrev, bNext, bRefresh, bConnect;
 Btn bStart, bZero, bAck, bRelay, bReset, bCsv;
 Btn bWarnM, bWarnP, bAlarmM, bAlarmP, bCntM, bCntP, bRpmM, bRpmP;
+Btn[] hdrBtns, leftBtns;   // listas fijas: evitan crear arrays en cada fotograma
 
 class Btn {
   float x, y, w, h;
@@ -81,6 +82,7 @@ class Btn {
 void setup() {
   size(1280, 800);
   surface.setTitle("Monitor de vibraciones - Mantenimiento predictivo");
+  frameRate(30);   // suficiente para esta interfaz y reduce el uso de CPU
   textFont(createFont("SansSerif", 14));
   stCol[0] = color(46, 204, 113);
   stCol[1] = color(241, 196, 15);
@@ -103,6 +105,9 @@ void setup() {
   bAlarmM = new Btn(160, 550, 30, 28, "-");  bAlarmP = new Btn(262, 550, 30, 28, "+");
   bCntM   = new Btn(160, 584, 30, 28, "-");  bCntP   = new Btn(262, 584, 30, 28, "+");
   bRpmM   = new Btn(160, 618, 30, 28, "-");  bRpmP   = new Btn(262, 618, 30, 28, "+");
+
+  hdrBtns  = new Btn[] {bPrev, bNext, bRefresh, bConnect};
+  leftBtns = new Btn[] {bStart, bZero, bAck, bRelay, bReset, bCsv, bWarnM, bWarnP, bAlarmM, bAlarmP, bCntM, bCntP, bRpmM, bRpmP};
 
   refreshPorts();
 }
@@ -286,7 +291,7 @@ void drawHeader() {
 
   bConnect.label = connected ? "DESCONECTAR" : "CONECTAR";
   bConnect.on = connected;
-  for (Btn b : new Btn[] {bPrev, bNext, bRefresh, bConnect}) b.show();
+  for (Btn b : hdrBtns) b.show();
 
   boolean stale = connected && running && (millis() - lastRx > 5000);
   fill(!connected ? color(150) : (stale ? stCol[1] : stCol[0]));
@@ -327,7 +332,7 @@ void drawLeft() {
   bAck.on = acked;
   bRelay.label = "RELE: " + (relayEn ? "ON" : "OFF"); bRelay.on = relayEn;
   bCsv.label = "CSV: " + (csvOn ? "ON" : "OFF"); bCsv.on = csvOn;
-  for (Btn b : new Btn[] {bStart, bZero, bAck, bRelay, bReset, bCsv, bWarnM, bWarnP, bAlarmM, bAlarmP, bCntM, bCntP, bRpmM, bRpmP}) b.show();
+  for (Btn b : leftBtns) b.show();
 
   param("Alerta (mm/s)", f1(warnT, 1), 516);
   param("Alarma (mm/s)", f1(alarmT, 1), 550);
