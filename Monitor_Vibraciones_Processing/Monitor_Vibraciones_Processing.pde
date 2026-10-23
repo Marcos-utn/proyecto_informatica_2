@@ -4,7 +4,8 @@
  *
  *  - Estado (Normal / Alerta / Alarma), valores numericos
  *  - Grafica en tiempo real, espectro de velocidad (con marcas 1x 2x 3x) y tendencia
- *  - Control: iniciar/parar, calibrar ruido, reconocer alarma, reset, rele, umbrales
+ *  - Control: iniciar/parar medicion, calibrar ruido, ACK, reset, umbrales,
+ *             arranque/parada del motor (contactor) y disparo automatico por alarma
  *  - Registro CSV en la carpeta "registros" del sketch
  *
  * No necesita librerias externas (solo processing.serial, incluida).
@@ -31,6 +32,8 @@ int state = 0, prevState = -1;
 float vmax, vx, vy, vz, arms, apeak, crest, fdom;
 int errs = 0;
 boolean haveData = false, running = true, acked = false, relayEn = false;
+boolean motorOn = false, tripped = false;   // estado del contactor y disparo por vibracion
+int motorArm = 0;                            // instante del primer clic de arranque (confirmacion)
 float warnT = 1.8, alarmT = 4.5;
 int cntN = 3;
 int rpm = 1500;
@@ -54,7 +57,7 @@ String[] stTxt = {"NORMAL", "ALERTA", "ALARMA"};
 color[] stCol = new color[3];
 ArrayList<Btn> btns = new ArrayList<Btn>();
 Btn bPrev, bNext, bRefresh, bConnect;
-Btn bStart, bZero, bAck, bRelay, bReset, bCsv;
+Btn bStart, bZero, bAck, bRelay, bReset, bCsv, bMotor;
 Btn bWarnM, bWarnP, bAlarmM, bAlarmP, bCntM, bCntP, bRpmM, bRpmP;
 Btn[] hdrBtns, leftBtns;   // listas fijas: evitan crear arrays en cada fotograma
 
@@ -94,20 +97,21 @@ void setup() {
   bRefresh = new Btn(964, 14, 34, 28, "R");
   bConnect = new Btn(1005, 14, 110, 28, "CONECTAR");
 
-  bStart = new Btn(20, 384, 132, 32, "PARAR");
-  bZero  = new Btn(160, 384, 132, 32, "CALIB. RUIDO");
-  bAck   = new Btn(20, 422, 132, 32, "ACK ALARMA");
-  bRelay = new Btn(160, 422, 132, 32, "RELE: OFF");
-  bReset = new Btn(20, 460, 132, 32, "RESET ESTADO");
-  bCsv   = new Btn(160, 460, 132, 32, "CSV: ON");
+  bStart = new Btn(20, 372, 132, 32, "PARAR");
+  bZero  = new Btn(160, 372, 132, 32, "CALIB. RUIDO");
+  bAck   = new Btn(20, 408, 132, 32, "ACK ALARMA");
+  bRelay = new Btn(160, 408, 132, 32, "DISPARO AUTO");
+  bReset = new Btn(20, 444, 132, 32, "RESET ESTADO");
+  bCsv   = new Btn(160, 444, 132, 32, "CSV: ON");
+  bMotor = new Btn(20, 484, 272, 40, "ARRANCAR MOTOR");
 
-  bWarnM  = new Btn(160, 516, 30, 28, "-");  bWarnP  = new Btn(262, 516, 30, 28, "+");
-  bAlarmM = new Btn(160, 550, 30, 28, "-");  bAlarmP = new Btn(262, 550, 30, 28, "+");
-  bCntM   = new Btn(160, 584, 30, 28, "-");  bCntP   = new Btn(262, 584, 30, 28, "+");
-  bRpmM   = new Btn(160, 618, 30, 28, "-");  bRpmP   = new Btn(262, 618, 30, 28, "+");
+  bWarnM  = new Btn(160, 536, 30, 28, "-");  bWarnP  = new Btn(262, 536, 30, 28, "+");
+  bAlarmM = new Btn(160, 568, 30, 28, "-");  bAlarmP = new Btn(262, 568, 30, 28, "+");
+  bCntM   = new Btn(160, 600, 30, 28, "-");  bCntP   = new Btn(262, 600, 30, 28, "+");
+  bRpmM   = new Btn(160, 632, 30, 28, "-");  bRpmP   = new Btn(262, 632, 30, 28, "+");
 
   hdrBtns  = new Btn[] {bPrev, bNext, bRefresh, bConnect};
-  leftBtns = new Btn[] {bStart, bZero, bAck, bRelay, bReset, bCsv, bWarnM, bWarnP, bAlarmM, bAlarmP, bCntM, bCntP, bRpmM, bRpmP};
+  leftBtns = new Btn[] {bStart, bZero, bAck, bRelay, bReset, bCsv, bMotor, bWarnM, bWarnP, bAlarmM, bAlarmP, bCntM, bCntP, bRpmM, bRpmP};
 
   refreshPorts();
 }
@@ -224,6 +228,11 @@ void parseLine(String s) {
   else if (c == 'C' && t.length >= 7) {
     warnT = fnum(t[1]); alarmT = fnum(t[2]); cntN = int(t[3]);
     running = int(t[4]) == 1; relayEn = int(t[5]) == 1; acked = int(t[6]) == 1;
+    if (t.length >= 12) {
+      boolean wasTripped = tripped;
+      motorOn = int(t[10]) == 1; tripped = int(t[11]) == 1;
+      if (tripped && !wasTripped) addEvent("DISPARO: motor desconectado");
+    }
   }
   else if (c == 'I' && t.length >= 2) addEvent(s.substring(2));
   else if (c == 'E' && t.length >= 2) addEvent("ERROR: " + s.substring(2));
@@ -248,7 +257,7 @@ void openCsv() {
   if (csv != null) return;
   String name = "registros/vibraciones_" + stamp(true) + ".csv";
   csv = createWriter(name);
-  csv.println("fecha_hora;estado;v_max_mm_s;vx_mm_s;vy_mm_s;vz_mm_s;acel_rms_g;acel_pico_g;factor_cresta;f_dominante_Hz;alerta_mm_s;alarma_mm_s");
+  csv.println("fecha_hora;estado;v_max_mm_s;vx_mm_s;vy_mm_s;vz_mm_s;acel_rms_g;acel_pico_g;factor_cresta;f_dominante_Hz;alerta_mm_s;alarma_mm_s;motor");
   csv.flush();
   addEvent("CSV: " + name);
 }
@@ -260,7 +269,7 @@ void closeCsv() {
 void writeCsv() {
   if (csv == null || !csvOn) return;
   csv.println(stamp(false) + ";" + stTxt[constrain(state, 0, 2)] + ";" + f3(vmax, 3) + ";" + f3(vx, 3) + ";" + f3(vy, 3) + ";" + f3(vz, 3)
-    + ";" + f3(arms, 4) + ";" + f3(apeak, 4) + ";" + f3(crest, 2) + ";" + f3(fdom, 1) + ";" + f3(warnT, 1) + ";" + f3(alarmT, 1));
+    + ";" + f3(arms, 4) + ";" + f3(apeak, 4) + ";" + f3(crest, 2) + ";" + f3(fdom, 1) + ";" + f3(warnT, 1) + ";" + f3(alarmT, 1) + ";" + (tripped ? "DISPARADO" : (motorOn ? "CONECTADO" : "DESCONECTADO")));
   csv.flush();
 }
 
@@ -313,8 +322,10 @@ void drawLeft() {
   fill(c); ellipse(62, 122, 78, 78);
   fill(255); textAlign(LEFT, CENTER); textSize(22);
   text(txt, 112, 112);
-  textSize(12); fill(170);
-  text(state == 2 && acked ? "Zumbador silenciado" : "Estado del motor", 112, 138);
+  textSize(12);
+  String mt = !connected ? "Motor: --" : (tripped ? "MOTOR DISPARADO" : (motorOn ? "MOTOR CONECTADO" : "MOTOR DESCONECTADO"));
+  fill(!connected ? color(150) : (tripped ? stCol[2] : (motorOn ? stCol[0] : color(170))));
+  text(mt, 112, 138);
 
   float y = 186;
   color vc = (haveData && running) ? c : color(230);
@@ -330,24 +341,31 @@ void drawLeft() {
 
   bStart.label = running ? "PARAR" : "INICIAR"; bStart.on = running;
   bAck.on = acked;
-  bRelay.label = "RELE: " + (relayEn ? "ON" : "OFF"); bRelay.on = relayEn;
+  bRelay.label = "DISPARO AUTO: " + (relayEn ? "ON" : "OFF"); bRelay.on = relayEn;
+  boolean armed = motorArm > 0 && millis() - motorArm < 3000;
+  if (!armed) motorArm = 0;
+  if (motorOn)       bMotor.label = "PARAR MOTOR";
+  else if (tripped)  bMotor.label = "DISPARADO: haga RESET";
+  else if (armed)    bMotor.label = "CONFIRMAR ARRANQUE (3 s)";
+  else               bMotor.label = "ARRANCAR MOTOR";
+  bMotor.on = motorOn || armed;
   bCsv.label = "CSV: " + (csvOn ? "ON" : "OFF"); bCsv.on = csvOn;
   for (Btn b : leftBtns) b.show();
 
-  param("Alerta (mm/s)", f1(warnT, 1), 516);
-  param("Alarma (mm/s)", f1(alarmT, 1), 550);
-  param("Lecturas conf.", str(cntN), 584);
-  param("Motor (rpm)", str(rpm), 618);
+  param("Alerta (mm/s)", f1(warnT, 1), 536);
+  param("Alarma (mm/s)", f1(alarmT, 1), 568);
+  param("Lecturas conf.", str(cntN), 600);
+  param("Motor (rpm)", str(rpm), 632);
 
   fill(200); textAlign(LEFT, TOP); textSize(13);
-  text("Eventos", 20, 660);
+  text("Eventos", 20, 668);
   textSize(11); fill(170);
   for (int i = 0; i < events.size(); i++) {
     String e = events.get(i);
     if (e.length() > 46) e = e.substring(0, 46);
-    text(e, 20, 678 + i * 13);
+    text(e, 20, 686 + i * 12);
   }
-  if (errs > 0 && connected) { fill(stCol[1]); textSize(11); text("Muestras perdidas en ventana: " + errs, 120, 660); }
+  if (errs > 0 && connected) { fill(stCol[1]); textSize(11); text("Muestras perdidas en ventana: " + errs, 100, 668); }
 }
 
 String f1(float v, int d) { return nf(v, 1, d); }
@@ -471,6 +489,12 @@ void onBtn(Btn b) {
   else if (b == bRefresh) { if (!connected) { refreshPorts(); addEvent(ports.length + " puerto(s) encontrado(s)"); } }
   else if (b == bConnect) connectPort();
   else if (b == bStart)   sendCmd(running ? "STOP" : "START");
+  else if (b == bMotor) {
+    if (motorOn) sendCmd("MOTOR,0");                                   // parar: inmediato
+    else if (tripped) addEvent("Pulse RESET ESTADO antes de arrancar");
+    else if (motorArm > 0 && millis() - motorArm < 3000) { sendCmd("MOTOR,1"); motorArm = 0; }
+    else motorArm = max(1, millis());                                   // arrancar: pide confirmacion
+  }
   else if (b == bZero)    sendCmd("ZERO");
   else if (b == bAck)     sendCmd("ACK");
   else if (b == bReset)   sendCmd("RESET");
