@@ -12,30 +12,38 @@
  *  - Estados: 0 NORMAL (verde), 1 ALERTA (amarillo), 2 ALARMA (rojo + zumbador),
  *    con histeresis y numero minimo de lecturas consecutivas.
  *  - Funciona de forma autonoma (LEDs/zumbador/rele) y se controla desde Processing.
+ *  - Maniobra del motor: un modulo de rele (activo en BAJO) comanda la bobina de un
+ *    contactor de 4 polos (3F+N). Arranque solo por orden expresa, disparo automatico
+ *    opcional por ALARMA con ENCLAVAMIENTO (no rearranca solo) y arranque siempre en OFF.
  *
  * Protocolo serie (115200 baud, lineas ASCII terminadas en \n)
  *  Arduino -> PC
  *    D,ms,estado,vmax,vx,vy,vz,aRMS_g,aPico_g,cresta,fdom_Hz,acked,errores
  *    S,binHz,n,v0,v1,...        (espectro de velocidad mm/s RMS, bins 0..n-1)
- *    C,alerta,alarma,lecturas,running,rele,acked,ruidoX,ruidoY,ruidoZ
+ *    C,alerta,alarma,lecturas,running,disparoAuto,acked,ruidoX,ruidoY,ruidoZ,motor,disparado
  *    I,texto    (informacion)      E,texto   (error)
  *  PC -> Arduino
  *    START | STOP | GET | ACK | RESET | ZERO | ZEROCLR
- *    TH,alerta,alarma,lecturas      RELAY,0|1
+ *    TH,alerta,alarma,lecturas      RELAY,0|1 (disparo automatico)      MOTOR,0|1
  */
 
 #include <Wire.h>
 #include <EEPROM.h>
 #include <math.h>
+#include <ctype.h>
 
 // ======================= PINES =======================
 const uint8_t PIN_LED_VERDE = 2;
 const uint8_t PIN_LED_AMAR  = 3;
 const uint8_t PIN_LED_ROJO  = 4;
-const uint8_t PIN_BUZZER    = 5;   // zumbador activo
+const uint8_t PIN_BUZZER    = 5;   // a la base de un NPN (via 2,2 kOhm) o al pin IO de un modulo buzzer activo
 const uint8_t PIN_BTN_ACK   = 6;   // pulsador a GND (INPUT_PULLUP)
-const uint8_t PIN_RELE      = 7;   // salida a modulo rele (opcional)
-const bool    RELE_ACTIVO_ALTO = true;
+// Modulo de rele de 4 canales con optoacopladores: se ACTIVA con 0 V (nivel BAJO).
+const uint8_t PINES_RELE[4] = {7, 8, 9, 10};   // IN1..IN4
+const uint8_t N_RELES = 1;     // 1 = IN1 comanda la bobina de un contactor (RECOMENDADO)
+                               // 4 = los 4 canales conmutan a la vez (solo para cargas dentro de la capacidad del rele)
+const bool    RELE_ACTIVO_ALTO = false;
+const uint32_t GRACIA_ARRANQUE_MS = 15000;   // tras arrancar no se dispara por vibracion (transitorio de arranque)
 
 // ======================= SENSOR ======================
 const uint8_t MPU_ADDR = 0x68;                 // AD0 a GND (0x69 si AD0 a 3,3 V)
@@ -70,7 +78,7 @@ Config cfg;
 // ======================= VARIABLES ===================
 int16_t raw[3][N];                  // 6 KB
 float   re[N], im[N];               // 8 KB
-float   cosT[N / 2];                // 2 KB (el seno se obtiene de esta tabla)
+float   cosT[N / 2 + 1];            // 2 KB: tabla de coseno para la FFT, el seno y la ventana Hann
 float   spec[K_HI + 1], specTmp[K_HI + 1];
 
 float vAxis[3], vRawAxis[3];
@@ -80,6 +88,9 @@ bool     running = true;
 bool     sensorFault = false;
 bool     acked = false;
 bool     zeroReq = false;
+bool     motorOn = false;     // contactor conectado
+bool     tripped = false;     // disparado por vibracion (enclavado hasta RESET)
+uint32_t motorOnAt = 0;
 uint8_t  state = 0, prevState = 0, upCnt = 0, dnCnt = 0;
 uint16_t winErrors = 0;
 uint8_t  windowsSinceCfg = 0;
@@ -226,7 +237,7 @@ void processWindow() {
 
     // 3) ventana Hann + FFT (aceleracion en m/s2)
     for (uint16_t i = 0; i < N; i++) {
-      float w = 0.5f * (1.0f - cosf(TWO_PI * i / N));
+      float w = 0.5f * (1.0f - cosT[(i <= N / 2) ? i : (N - i)]);   // Hann desde la tabla (sin cosf)
       re[i] = ((float)raw[a][i] - mean) * ACC_SCALE * w;
       im[i] = 0;
     }
@@ -285,10 +296,18 @@ void updateState(float v) {
 }
 
 // ======================= SALIDAS =====================
+// Escribe el pin solo si cambia el valor (menos carga y menos jitter en el muestreo)
+inline void outWrite(uint8_t pin, bool v, int8_t &cache) {
+  if (cache != (int8_t)v) { digitalWrite(pin, v); cache = v; }
+}
+
 void updateOutputs() {
   uint32_t now = millis();
-  bool g = false, y = false, r = false, bz = false;
+  static uint32_t lastRun = 0;
+  if (now - lastRun < 5) return;           // 200 Hz sobran para LEDs, zumbador y pulsador
+  lastRun = now;
 
+  bool g = false, y = false, r = false, bz = false;
   if (sensorFault) {
     bool b = ((now / 250) % 2) == 0;       // fallo de sensor: los 3 LEDs parpadean
     g = y = r = b;
@@ -302,13 +321,17 @@ void updateOutputs() {
       bz = !acked && (((now / 400) % 2) == 0);
     }
   }
-  digitalWrite(PIN_LED_VERDE, g);
-  digitalWrite(PIN_LED_AMAR, y);
-  digitalWrite(PIN_LED_ROJO, r);
-  digitalWrite(PIN_BUZZER, bz);
 
-  bool relOn = cfg.relay && running && !sensorFault && state == 2;
-  digitalWrite(PIN_RELE, RELE_ACTIVO_ALTO ? relOn : !relOn);
+  static int8_t cG = -1, cY = -1, cR = -1, cB = -1;
+  static int8_t cRel[4] = {-1, -1, -1, -1};
+  outWrite(PIN_LED_VERDE, g, cG);
+  outWrite(PIN_LED_AMAR,  y, cY);
+  outWrite(PIN_LED_ROJO,  r, cR);
+  outWrite(PIN_BUZZER,    bz, cB);
+
+  // Todos los canales usados cambian en la misma pasada (microsegundos de diferencia)
+  for (uint8_t i = 0; i < N_RELES; i++)
+    outWrite(PINES_RELE[i], RELE_ACTIVO_ALTO ? motorOn : !motorOn, cRel[i]);
 
   static uint32_t lastBtn = 0;
   if (digitalRead(PIN_BTN_ACK) == LOW && now - lastBtn > 300) {
@@ -327,6 +350,8 @@ void sendConfig() {
   Serial.print(cfg.relay);     Serial.print(',');
   Serial.print(acked ? 1 : 0);
   for (uint8_t a = 0; a < 3; a++) { Serial.print(','); Serial.print(cfg.noise[a], 3); }
+  Serial.print(','); Serial.print(motorOn ? 1 : 0);
+  Serial.print(','); Serial.print(tripped ? 1 : 0);
   Serial.println();
 }
 
@@ -354,6 +379,15 @@ void sendResults() {
   Serial.println();
 }
 
+void setMotor(bool on, const char *msg) {
+  if (on && !motorOn) {
+    motorOnAt = millis();
+    state = prevState = 0; upCnt = dnCnt = 0; acked = false;   // evalua el motor desde cero
+  }
+  motorOn = on;
+  sendInfo(msg);
+}
+
 void processCommand(char *s) {
   for (char *p = s; *p; p++) *p = toupper(*p);
 
@@ -361,12 +395,24 @@ void processCommand(char *s) {
   else if (strcmp(s, "STOP") == 0)    { running = false; sendConfig(); }
   else if (strcmp(s, "GET") == 0)     { sendConfig(); }
   else if (strcmp(s, "ACK") == 0)     { acked = true; sendConfig(); }
-  else if (strcmp(s, "RESET") == 0)   { state = prevState = 0; upCnt = dnCnt = 0; acked = false;
+  else if (strcmp(s, "RESET") == 0)   { state = prevState = 0; upCnt = dnCnt = 0; acked = false; tripped = false;
                                         sendInfo("Estado reiniciado"); sendConfig(); }
   else if (strcmp(s, "ZERO") == 0)    { zeroReq = true;
                                         sendInfo("Calibrando ruido del sensor (motor PARADO)..."); }
   else if (strcmp(s, "ZEROCLR") == 0) { cfg.noise[0] = cfg.noise[1] = cfg.noise[2] = 0;
                                         saveConfig(); sendInfo("Ruido de referencia borrado"); sendConfig(); }
+  else if (strncmp(s, "MOTOR,", 6) == 0) {
+    if (atoi(s + 6) == 0) {
+      setMotor(false, "Motor DESCONECTADO (orden remota)");
+    } else if (tripped) {
+      Serial.println("E,Motor disparado: haga RESET antes de arrancar");
+    } else if (cfg.relay && (sensorFault || !running)) {
+      Serial.println("E,Con disparo automatico activo la medicion debe estar en marcha y el sensor sin fallo");
+    } else {
+      setMotor(true, "Motor CONECTADO (orden remota)");
+    }
+    sendConfig();
+  }
   else if (strncmp(s, "RELAY,", 6) == 0) {
     cfg.relay = (atoi(s + 6) != 0); saveConfig(); sendConfig();
   }
@@ -406,15 +452,17 @@ void setup() {
   pinMode(PIN_LED_AMAR, OUTPUT);
   pinMode(PIN_LED_ROJO, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
-  pinMode(PIN_RELE, OUTPUT);
+  for (uint8_t i = 0; i < N_RELES; i++) {          // reles en reposo (motor desconectado) lo antes posible
+    pinMode(PINES_RELE[i], OUTPUT);
+    digitalWrite(PINES_RELE[i], RELE_ACTIVO_ALTO ? LOW : HIGH);
+  }
   pinMode(PIN_BTN_ACK, INPUT_PULLUP);
-  digitalWrite(PIN_RELE, RELE_ACTIVO_ALTO ? LOW : HIGH);
 
   Serial.begin(115200);
   delay(300);
 
   loadConfig();
-  for (uint16_t k = 0; k < N / 2; k++) cosT[k] = cosf(TWO_PI * k / N);
+  for (uint16_t k = 0; k <= N / 2; k++) cosT[k] = cosf(TWO_PI * k / N);
 
   // prueba de LEDs
   digitalWrite(PIN_LED_VERDE, HIGH); delay(200);
@@ -462,6 +510,15 @@ void loop() {
   }
 
   updateState(vMax);
+
+  // Disparo automatico: ALARMA confirmada (N lecturas) con el motor ya fuera del transitorio de arranque.
+  // Queda ENCLAVADO: el motor NO se reconecta solo aunque la vibracion baje; hace falta RESET + orden de arranque.
+  if (cfg.relay && motorOn && state == 2 && (millis() - motorOnAt) > GRACIA_ARRANQUE_MS) {
+    tripped = true;
+    motorOn = false;
+    sendInfo("DISPARO por vibracion: motor DESCONECTADO (enclavado hasta RESET)");
+    sendConfig();
+  }
   sendResults();
   if (++windowsSinceCfg >= 10) { windowsSinceCfg = 0; sendConfig(); }
 }
